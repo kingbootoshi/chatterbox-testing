@@ -232,6 +232,67 @@ class CausalConditionalCFM(ConditionalCFM):
 
         return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond, meanflow=meanflow), None
 
+    @torch.inference_mode()
+    def forward_streaming(
+        self,
+        mu,                    # (B, 80, T_total)
+        mask,                  # (B, 1, T_total)
+        n_timesteps,
+        spks=None,             # (B, 80)
+        cond=None,             # (B, 80, T_total)
+        z_cache=None,          # (B, 80, T_cached) - cached noise from previous call
+        meanflow=False,
+    ):
+        """
+        Streaming forward with z_cache for noise continuity.
+
+        This enables true streaming by caching ONLY the noise vector `z` between
+        chunks. The encoder output `mu` is deterministically recomputed each time,
+        but by reusing the same noise for previously generated frames, the ODE
+        solver produces consistent outputs without boundary artifacts.
+
+        Key insight: mu is deterministic (same tokens → same mu), but z is stochastic.
+        We cache z to ensure consistency across cumulative generations.
+
+        Args:
+            mu: encoder output (B, 80, T_total) - fresh from encoder each call
+            mask: output mask (B, 1, T_total)
+            n_timesteps: number of diffusion steps
+            spks: speaker embedding (B, 80)
+            cond: conditioning (prompt mel) (B, 80, T_total)
+            z_cache: cached noise from previous call (B, 80, T_cached) or None
+            meanflow: whether to use meanflow mode
+
+        Returns:
+            (x, new_z_cache): generated mel and updated noise cache
+        """
+        B, C, T_total = mu.shape
+
+        # 1) Sample noise for the full sequence
+        z = torch.randn_like(mu)
+
+        # 2) Restore cached noise for previously generated frames
+        # This ensures the prefix produces identical output to previous calls
+        if z_cache is not None:
+            T_cached = min(z_cache.shape[2], T_total)
+            z[:, :, :T_cached] = z_cache[:, :, :T_cached]
+
+        # 3) Build time grid
+        t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
+        if (not meanflow) and (self.t_scheduler == "cosine"):
+            t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
+
+        # 4) Run ODE solver
+        if meanflow:
+            x = self.basic_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond)
+        else:
+            x = self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond, meanflow=meanflow)
+
+        # 5) Cache ALL noise for next call (sequence grows cumulatively)
+        new_z_cache = z.clone()
+
+        return x, new_z_cache
+
     def basic_euler(self, x, t_span, mu, mask, spks, cond):
         in_dtype = x.dtype
         x, t_span, mu, mask, spks, cond = cast_all(x, t_span, mu, mask, spks, cond, dtype=self.estimator.dtype)

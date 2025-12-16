@@ -20,11 +20,37 @@ cd streaming-tts-experiment
 # Start server (loads model once)
 uv run python server.py
 
-# Test streaming (in another terminal)
-uv run python client.py "Hello my big long beautiful world" --tokens 10
+# Test stateful streaming (RECOMMENDED - seamless audio)
+uv run python client.py "Hello my big long beautiful world" --stateful --tokens 10
 
-# Compare with simple mode
+# Test basic streaming
+uv run python client.py "Hello world" --tokens 10
+
+# Compare with simple mode (baseline)
 uv run python client.py "Hello world" --simple
+```
+
+## Streaming Modes
+
+### Stateful Mode (Recommended)
+Uses S3Gen's built-in streaming support for seamless audio:
+- `finalize=False` keeps last 3 tokens as lookahead
+- HiFiGAN `cache_source` maintains audio continuity between chunks
+
+```bash
+uv run python client.py "Your text here" --stateful --tokens 15
+```
+
+### Crossfade Mode
+Overlap-add crossfading at chunk boundaries:
+```bash
+uv run python client.py "Your text here" --crossfade --overlap 3
+```
+
+### Simple Mode
+Full generation then streaming (baseline comparison):
+```bash
+uv run python client.py "Your text here" --simple
 ```
 
 ## Current Status
@@ -33,10 +59,7 @@ uv run python client.py "Hello world" --simple
 - Fast time-to-first-audio via chunked streaming
 - Pre-cached voice conditionals (instant load)
 - MPS acceleration on Mac
-
-**Known Issue**:
-- Audio has audible breaks between chunks
-- See [EXPERIMENTS.md](docs/EXPERIMENTS.md) for solutions
+- State-passing streaming with HiFiGAN cache (v0.4)
 
 ## Documentation
 
@@ -57,9 +80,20 @@ Text → T3 (generate tokens)
 
 ## API
 
+### Stateful Endpoint: `/ws/tts/stateful` (Recommended)
+```json
+{"text": "Hello world", "tokens_per_chunk": 15}
+```
+Uses HiFiGAN cache + finalize control for seamless audio.
+
 ### Streaming Endpoint: `/ws/tts`
 ```json
 {"text": "Hello world", "tokens_per_chunk": 10}
+```
+
+### Crossfade Endpoint: `/ws/tts/crossfade`
+```json
+{"text": "Hello world", "tokens_per_chunk": 25, "overlap_tokens": 3}
 ```
 
 ### Simple Endpoint: `/ws/tts/simple`
@@ -70,16 +104,6 @@ Text → T3 (generate tokens)
 ### Response
 - Binary frames: PCM int16 audio @ 24kHz mono
 - Final JSON: `{"type": "complete", "stats": {...}}`
-
-## Next Steps
-
-Three parallel experiments to eliminate chunk artifacts:
-
-1. **Overlap-Add Crossfade** - Quick win, blend chunk boundaries
-2. **Parallel Pipeline** - Run T3 and S3Gen concurrently
-3. **S3Gen Context** - Pass state between chunks for seamless audio
-
-See [EXPERIMENTS.md](docs/EXPERIMENTS.md) for details.
 
 ## Files
 

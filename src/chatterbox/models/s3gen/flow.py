@@ -196,3 +196,102 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         feat = feat[:, :, mel_len1:]
         assert feat.shape[2] == mel_len2
         return feat, None  # NOTE jrm: why are they returning None here?
+
+    @torch.inference_mode()
+    def inference_streaming(
+        self,
+        token,
+        token_len,
+        prompt_token,
+        prompt_token_len,
+        prompt_feat,
+        prompt_feat_len,
+        embedding,
+        finalize,
+        n_timesteps=10,
+        meanflow=False,
+        z_cache=None,
+    ):
+        """
+        Streaming inference with z_cache for noise continuity.
+
+        This method is similar to inference() but passes z_cache through
+        to the decoder's forward_streaming() method. By caching the noise
+        vector z between calls, we ensure that previously generated audio
+        remains consistent as more tokens are added.
+
+        Args:
+            token: speech tokens (B, n_toks)
+            token_len: token lengths (B,)
+            prompt_token: reference tokens (1 or B, n_prompt)
+            prompt_token_len: reference token lengths (1 or B,)
+            prompt_feat: reference mel features (1 or B, n_feat, 80)
+            prompt_feat_len: reference feature lengths (1 or B,) or None
+            embedding: speaker embedding (1 or B, 192)
+            finalize: whether streaming is complete
+            n_timesteps: number of diffusion steps
+            meanflow: whether to use meanflow mode
+            z_cache: cached noise from previous call (B, 80, T_cached) or None
+
+        Returns:
+            (feat, new_z_cache): generated mel and updated noise cache
+        """
+        B = token.size(0)
+
+        # 1. Speaker + prompt expansion (same as inference)
+        embedding = torch.atleast_2d(embedding)
+        embedding = F.normalize(embedding, dim=1)
+        embedding = self.spk_embed_affine_layer(embedding)
+
+        prompt_token = _repeat_batch_dim(prompt_token, B, ndim=2)
+        prompt_token_len = _repeat_batch_dim(prompt_token_len, B, ndim=1)
+        prompt_feat = _repeat_batch_dim(prompt_feat, B, ndim=3)
+        prompt_feat_len = _repeat_batch_dim(prompt_feat_len, B, ndim=1)
+        embedding = _repeat_batch_dim(embedding, B, ndim=2)
+
+        # 2. Concat prompt + speech tokens
+        token, token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + token_len
+        mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
+
+        if (token >= self.vocab_size).any():
+            logger.error(f"{token.max()}>{self.vocab_size} out-of-range tokens in flow!")
+        token = self.input_embedding(token.long()) * mask
+
+        # 3. Encoder - run on FULL sequence (don't crop yet, need full z_cache)
+        h, h_masks = self.encoder(token, token_len)
+
+        # Compute lengths BEFORE any cropping
+        T_mel_full = h.shape[1]
+        mel_len1 = prompt_feat.shape[1]  # prompt mel frames
+
+        h = self.encoder_proj(h)
+
+        # 4. Build conds (prompt mel only)
+        conds = torch.zeros([B, T_mel_full, self.output_size],
+                            device=token.device, dtype=h.dtype)
+        conds[:, :mel_len1] = prompt_feat
+        conds = conds.transpose(1, 2)
+
+        # 5. Mask for flow - use FULL T_mel size
+        mask = torch.ones([B, 1, T_mel_full], device=h.device, dtype=h.dtype)
+
+        # 6. Flow streaming with z_cache - run on FULL sequence for z_cache continuity
+        feat, new_z_cache = self.decoder.forward_streaming(
+            mu=h.transpose(1, 2).contiguous(),
+            mask=mask,
+            n_timesteps=n_timesteps,
+            spks=embedding,
+            cond=conds,
+            z_cache=z_cache,
+            meanflow=meanflow,
+        )
+
+        # 7. Drop prompt mel, keep speech mel only
+        feat = feat[:, :, mel_len1:]
+
+        # 8. Apply lookahead crop AFTER flow (preserves z_cache for lookahead frames)
+        if finalize is False:
+            crop_frames = self.pre_lookahead_len * self.token_mel_ratio  # 3 * 2 = 6
+            feat = feat[:, :, :-crop_frames]
+
+        return feat, new_z_cache

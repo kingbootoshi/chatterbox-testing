@@ -327,6 +327,59 @@ class S3Token2Wav(S3Token2Mel):
         return self.mel2wav.inference(speech_feat=speech_feat, cache_source=cache_source)
 
     @torch.inference_mode()
+    def flow_stream_step(
+        self,
+        speech_tokens,
+        ref_dict,
+        z_cache=None,
+        n_cfm_timesteps=None,
+        finalize=False,
+    ):
+        """
+        Single streaming step: tokens → mel with z_cache noise continuity.
+
+        This method enables true streaming by caching the noise vector z
+        between calls. Each call processes all accumulated tokens, but reuses
+        cached noise for previously generated frames to ensure consistency.
+
+        Args:
+            speech_tokens: accumulated speech tokens (1, T_total)
+            ref_dict: reference audio embeddings (prompt_token, prompt_feat, embedding, etc.)
+            z_cache: cached noise from previous call (B, 80, T_cached) or None
+            n_cfm_timesteps: number of CFM diffusion steps (default: 2 for meanflow)
+            finalize: whether this is the final chunk (include lookahead)
+
+        Returns:
+            (output_mels, new_z_cache): generated mel and updated noise cache
+        """
+        n_cfm_timesteps = n_cfm_timesteps or (2 if self.meanflow else 10)
+
+        speech_tokens = torch.atleast_2d(speech_tokens)
+        speech_token_lens = torch.LongTensor([speech_tokens.size(-1)]).to(self.device)
+
+        # Cast ref_dict to device/dtype
+        ref_dict_cast = {}
+        for rk in list(ref_dict):
+            val = ref_dict[rk]
+            if isinstance(val, np.ndarray):
+                val = torch.from_numpy(val)
+            if torch.is_tensor(val):
+                val = val.to(device=self.device, dtype=self.dtype)
+            ref_dict_cast[rk] = val
+
+        output_mels, new_z_cache = self.flow.inference_streaming(
+            token=speech_tokens,
+            token_len=speech_token_lens,
+            finalize=finalize,
+            n_timesteps=n_cfm_timesteps,
+            meanflow=self.meanflow,
+            z_cache=z_cache,
+            **ref_dict_cast,
+        )
+
+        return output_mels, new_z_cache
+
+    @torch.inference_mode()
     def inference(
         self,
         speech_tokens,
