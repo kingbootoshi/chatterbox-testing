@@ -50,6 +50,7 @@ SAMPLE_RATE = 24000
 DEFAULT_CHUNK_DURATION_MS = 200
 VOICE_PATH = Path(__file__).parent.parent / "voices" / "qb_voice.pt"
 TOKENS_PER_CHUNK = 25  # ~1 second of audio per chunk (25 tokens/sec)
+FIRST_CHUNK_TOKENS = 12  # Smaller first chunk for faster TTFB (~480ms of tokens)
 
 # Overlap-add crossfade settings
 OVERLAP_TOKENS = 3  # Number of tokens to overlap between chunks
@@ -1070,7 +1071,8 @@ async def tts_flow_websocket(websocket: WebSocket):
                 await websocket.send_json({"type": "error", "message": "No text provided"})
                 continue
 
-            logger.info(f"Client {client_id} (flow): '{text[:50]}...' (tokens_per_chunk={tokens_per_chunk})")
+            first_chunk_tokens = request.get("first_chunk_tokens", FIRST_CHUNK_TOKENS)
+            logger.info(f"Client {client_id} (flow): '{text[:50]}...' (first={first_chunk_tokens}, chunk={tokens_per_chunk})")
 
             async with generation_lock:
                 t_start = time.perf_counter()
@@ -1149,8 +1151,10 @@ async def tts_flow_websocket(websocket: WebSocket):
                             break
 
                         # Process chunk when enough NEW tokens accumulated since last emission
+                        # Use smaller threshold for first chunk to reduce TTFB
                         new_tokens = len(streamer.speech_tokens) - last_emitted_count
-                        if new_tokens >= tokens_per_chunk:
+                        threshold = first_chunk_tokens if chunk_count == 0 else tokens_per_chunk
+                        if new_tokens >= threshold:
                             audio = await asyncio.to_thread(streamer.step, False)
                             last_emitted_count = len(streamer.speech_tokens)
 
@@ -1185,6 +1189,8 @@ async def tts_flow_websocket(websocket: WebSocket):
                             "realtime_factor": round(t_total / audio_duration, 3) if audio_duration > 0 else 0,
                             "total_tokens": len(all_tokens),
                             "chunks_sent": chunk_count,
+                            "first_chunk_tokens": first_chunk_tokens,
+                            "tokens_per_chunk": tokens_per_chunk,
                             "mode": "flow_streaming",
                         }
                     }

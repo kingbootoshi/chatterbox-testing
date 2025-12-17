@@ -1,157 +1,199 @@
-# Deep Analysis Request: Chatterbox Flow Streaming
+# Deep Optimization Analysis: Chatterbox Flow Streaming v2
 
 ## Context
 
-We've implemented TRUE flow-level streaming for Chatterbox TTS by caching the noise vector `z` between streaming calls. This ensures chunks share a coherent latent trajectory through the CFM ODE solver.
+We've implemented TRUE flow-level streaming for Chatterbox TTS with z_cache continuity. It's working but we have two major performance issues:
 
-**Current Status**: 95% working! Audio chunks flow smoothly into each other. But the VERY LAST frame gets cut off.
+1. **~900ms client-side latency gap** - Server sends at 881ms, client receives at 1836ms
+2. **Chunk hiccups** - Gaps between chunks when playback catches up to processing
 
-## What We Built
+## Current Architecture
 
-### Architecture
 ```
-T3 (autoregressive) → S3Gen (CFM: tokens→mel) → HiFiGAN (mel→wav)
+T3 (autoregressive) → S3Gen (CFM: tokens→mel) → HiFiGAN (mel→wav) → WebSocket → Client
      ↓                      ↓                        ↓
   tokens            z_cache continuity         cache_source
 ```
 
-### Key Innovation: z_cache
-```python
-# In forward_streaming():
-z = torch.randn_like(mu)  # Fresh noise for full sequence
+### Current Flow (BLOCKING/SEQUENTIAL)
 
-# Restore cached noise for previously generated frames
-if z_cache is not None:
-    T_cached = min(z_cache.shape[2], T_total)
-    z[:, :, :T_cached] = z_cache[:, :, :T_cached]
-
-# ... run ODE solver ...
-
-# Cache ALL noise for next call
-new_z_cache = z.clone()
+```
+T3:   [gen 12 tok]────────────[gen 25 tok]────────────[gen 25 tok]
+CFM:              [proc 12 tok]            [proc 37 tok]           [proc 62 tok]
+Send:                         [send]                   [send]                   [send]
+Play:                              [play ~500ms]            [play ~1s]
+                                    ^                        ^
+                                 HICCUP                   HICCUP
+                              (if play ends            (if play ends
+                               before next              before next
+                               send arrives)            send arrives)
 ```
 
 ### Current Metrics
-- TTFB: ~1.4s (want < 500ms)
-- RTF: 1.19-1.85x
-- Chunks: 4 for ~3.4s audio
-- Quality: Smooth continuity EXCEPT last frame cutoff
+
+| Metric | Value |
+|--------|-------|
+| Server TTFB | 723-881ms |
+| Client TTFB | 1565-1836ms |
+| Gap | ~900ms |
+| RTF | 1.14-1.30x |
+| First chunk tokens | 12 |
+| Subsequent chunk tokens | 25 |
 
 ---
 
 ## Three Questions
 
-### Question 1: Why is the VERY LAST audio frame getting cut off?
+### Question 1: Why is there a ~900ms client-side latency gap?
 
-We fixed double-lookahead and z_cache alignment, but still losing the final ~50-100ms.
+Server logs show first chunk sent at 881ms, but client doesn't receive until 1836ms.
 
-**Hypothesis A**: Token filtering removes EOS but z_cache was built including it
-**Hypothesis B**: HiFiGAN cache_source truncation loses final samples
-**Hypothesis C**: Client-side playback issue (doesn't flush final buffer)
-**Hypothesis D**: finalize=True path has different behavior than expected
+**Hypothesis A**: asyncio event loop blocked during `asyncio.to_thread(streamer.step)`
+- The thread runs CFM inference (~180ms for 2 ODE steps)
+- Event loop waits for thread completion
+- WebSocket send is queued but not executed until thread returns
+
+**Hypothesis B**: Client-side websocket buffering
+- websockets library may buffer incoming binary data
+- `recv()` might not return immediately when data arrives
+
+**Hypothesis C**: sounddevice/PortAudio initialization
+- First call to `sd.OutputStream()` may have latency
+- Audio device initialization happens on first chunk
+
+**Hypothesis D**: Network/OS buffering (unlikely on localhost)
 
 Key code paths to examine:
-1. `_run_flow()` token filtering: `speech_tokens[:, speech_tokens[0] < 6561]`
-2. `step()` final chunk: `streamer.step(True)` with finalize=True
-3. HiFiGAN cache truncation in step()
-4. Client audio buffer handling
+1. Server: `asyncio.to_thread(streamer.step, False)` then `websocket.send_bytes()`
+2. Client: `await websocket.recv()` then `player.add_chunk()`
 
-### Question 2: How to implement Pipeline Parallelism for faster chunk delivery?
+### Question 2: How to eliminate chunk hiccups?
 
-Current flow is SEQUENTIAL (blocking):
+The hiccup occurs when:
+1. Chunk N finishes playing (e.g., ~500ms of audio)
+2. Chunk N+1 is still being generated (T3) or processed (CFM)
+3. Result: silence gap until chunk N+1 arrives
+
+**Current timing analysis**:
+- First chunk: 12 tokens → ~12 mel frames → ~240ms audio (too short!)
+- CFM processing: ~180-200ms per step (but processes ALL tokens cumulatively)
+- T3 generation: ~25 tokens/sec → 25 tokens = 1000ms
+- Audio per 25 tokens: ~1000ms
+
+**The math doesn't work**:
+- We need 1000ms of audio buffered to cover 1000ms of T3 generation
+- But first chunk is only ~240ms (12 tokens)
+- By the time chunk 1 finishes playing, chunk 2 might not be ready
+
+**Potential solutions**:
+1. **Larger first chunk** (more tokens = longer audio buffer)
+2. **Faster CFM** (torch.compile, quantization)
+3. **Pipeline parallelism** (generate tokens while CFM processes)
+4. **Predictive buffering** (pre-buffer 2 chunks before playing)
+
+### Question 3: How to implement pipeline parallelism?
+
+**Goal**: Run T3 token generation in parallel with CFM processing
+
+**Proposed architecture**:
+```python
+# Thread 1: T3 token generation
+async def token_generator():
+    while not done:
+        token = generate_next_token()
+        token_queue.put(token)
+
+# Thread 2: CFM processing (triggered when chunk ready)
+async def cfm_processor():
+    while not done:
+        if len(accumulated_tokens) >= chunk_size:
+            mels = run_cfm(accumulated_tokens)
+            mel_queue.put(mels)
+
+# Thread 3: HiFiGAN + Send (triggered when mels ready)
+async def audio_sender():
+    while not done:
+        mels = mel_queue.get()
+        audio = run_hifigan(mels)
+        await websocket.send_bytes(audio)
 ```
-T3: [gen 25 tok]        [gen 25 tok]        [gen 25 tok]
-CFM:            [proc]              [proc]              [proc]
-Out:                 [send]              [send]
-    |----1s----|----1s----|----1s----|
-```
 
-Want PARALLEL (pipelined):
-```
-T3:  [gen 25][gen 25][gen 25][gen 25]
-CFM:      [proc 1][proc 2][proc 3]
-Out:           [send 1][send 2][send 3]
-     |--500ms--|--500ms--|--500ms--|
-```
+**Challenges**:
+1. **z_cache synchronization**: CFM needs z_cache from previous run
+2. **Cumulative processing**: CFM re-processes ALL tokens each time
+3. **Memory growth**: Token queue grows unbounded
+4. **Thread safety**: PyTorch tensors, CUDA streams
 
-Questions:
-1. Best async pattern? (asyncio.Queue, threading, multiprocessing?)
-2. How to coordinate T3 and CFM without blocking?
-3. How to handle EOS signal propagation?
-4. Memory considerations for queued tokens/mels?
-
-### Question 3: How to optimize TTFB to < 500ms?
-
-Current TTFB breakdown (estimated):
-- T3 generates 25 tokens: ~400ms
-- CFM processes 25 tokens: ~500ms
-- HiFiGAN converts mels: ~100ms
-- Network/overhead: ~100ms
-- **Total: ~1100-1400ms**
-
-Potential optimizations:
-1. Smaller first chunk (15 tokens instead of 25)?
-2. Speculative CFM start while T3 is still generating?
-3. torch.compile() for CFM?
-4. Reduce CFM timesteps (currently 2)?
-5. Warm-up/pre-allocation?
+**Alternative: Speculative CFM**
+Start CFM on N tokens while T3 generates token N+1, N+2, etc.
+When CFM finishes, if new tokens arrived, re-run CFM on extended sequence.
 
 ---
 
 ## Files for Context
 
-### Core Model Files (provide these)
+### Server-side (provide these)
 
-1. **s3gen.py** - S3Token2Wav class with `flow_stream_step()`
-2. **flow.py** - CausalMaskedDiffWithXvec with `inference_streaming()`
-3. **flow_matching.py** - CausalConditionalCFM with `forward_streaming()`
+1. **`streaming-tts-experiment/server.py`**
+   - `S3GenStreamer` class (lines 64-176)
+   - `/ws/tts/flow` endpoint (lines 1043-1206)
 
-### Server/Client (provide these)
+2. **`src/chatterbox/models/s3gen/s3gen.py`**
+   - `flow_stream_step()` method
 
-4. **server.py** - S3GenStreamer class and `/ws/tts/flow` endpoint
-5. **client.py** - WebSocket client with `--flow` mode
+3. **`src/chatterbox/models/s3gen/flow.py`**
+   - `inference_streaming()` method
+
+4. **`src/chatterbox/models/s3gen/flow_matching.py`**
+   - `forward_streaming()` method
+
+### Client-side (provide these)
+
+5. **`streaming-tts-experiment/client.py`**
+   - `StreamingAudioPlayer` class
+   - `--flow` mode handler
 
 ---
 
 ## Specific Code to Analyze
 
-### Token Filtering (potential cutoff cause)
+### Server: asyncio.to_thread blocking pattern
 ```python
-# server.py _run_flow()
-speech_tokens = speech_tokens[:, speech_tokens[0] < 6561]
-```
+# server.py /ws/tts/flow endpoint
+# This runs CFM in a thread - does it block the event loop?
+audio = await asyncio.to_thread(streamer.step, False)
+last_emitted_count = len(streamer.speech_tokens)
 
-### Lookahead Handling (we moved crop to AFTER flow)
-```python
-# flow.py inference_streaming()
-# 8. Apply lookahead crop AFTER flow (preserves z_cache for lookahead frames)
-if finalize is False:
-    crop_frames = self.pre_lookahead_len * self.token_mel_ratio  # 3 * 2 = 6
-    feat = feat[:, :, :-crop_frames]
-```
-
-### HiFiGAN Cache Truncation
-```python
-# server.py step()
-# Truncate cache_source if larger than current mel chunk needs
-if cache.shape[2] > expected_source_size:
-    cache = cache[:, :, -expected_source_size:]
-
-# Limit cache after use
-CACHE_TAIL_SAMPLES = 2400  # ~100ms at 24kHz
-if new_cache.shape[2] > CACHE_TAIL_SAMPLES:
-    new_cache = new_cache[:, :, -CACHE_TAIL_SAMPLES:]
-```
-
-### Final Chunk Emission
-```python
-# server.py endpoint
-# Final chunk with finalize=True
-remaining_tokens = len(streamer.speech_tokens) - last_emitted_count
-audio = await asyncio.to_thread(streamer.step, True)
 if len(audio) > 0:
     chunk_count += 1
-    await websocket.send_bytes(audio.tobytes())
+    if t_first_chunk is None:
+        t_first_chunk = time.perf_counter()  # Recorded AFTER thread returns
+        logger.success(f"First chunk in {(t_first_chunk - t_start)*1000:.0f}ms")
+
+    await websocket.send_bytes(audio.tobytes())  # Sent AFTER thread returns
+```
+
+### Client: WebSocket receive + audio queue
+```python
+# client.py flow mode
+while True:
+    message = await websocket.recv()
+
+    if isinstance(message, bytes):
+        player.add_chunk(message)  # When exactly is this called?
+        chunks_received += 1
+```
+
+### CFM cumulative processing (O(n²) issue)
+```python
+# flow.py inference_streaming
+# This runs on ALL accumulated tokens, not just new ones
+h, h_masks = self.encoder(token, token_len)  # Full sequence!
+# ...
+feat, new_z_cache = self.decoder.forward_streaming(
+    mu=h.transpose(1, 2).contiguous(),  # Full sequence!
+    # ...
+)
 ```
 
 ---
@@ -160,9 +202,24 @@ if len(audio) > 0:
 
 Please provide:
 
-1. **Root cause analysis** for last-frame cutoff with specific fix
-2. **Pipeline parallelism design** with code structure
-3. **TTFB optimization strategy** prioritized by impact/effort
-4. **Any architectural concerns** with current approach
+1. **Root cause analysis** for the ~900ms client latency gap
+   - Is it server-side (asyncio blocking)?
+   - Is it client-side (websocket buffering, audio init)?
+   - Provide instrumentation code to measure each segment
 
-Focus on practical, implementable solutions. We're close to production-ready streaming!
+2. **Chunk hiccup elimination strategy**
+   - Mathematical analysis: tokens needed for continuous playback
+   - Recommendation: larger first chunk vs pipeline parallelism vs buffering
+
+3. **Pipeline parallelism design** (if recommended)
+   - Thread/async architecture
+   - z_cache synchronization strategy
+   - Memory management
+   - Code structure
+
+4. **Quick wins** that can be implemented in 10-15 minutes
+   - Instrument latency
+   - Adjust chunk sizes
+   - Pre-buffer strategy
+
+Focus on practical, implementable solutions. Current system is 90% there - we just need to smooth out the latency and hiccups!

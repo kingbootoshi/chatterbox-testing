@@ -178,6 +178,93 @@ Client Metrics:
 
 ---
 
+### Smaller First Chunk Optimization (2025-12-16)
+
+**Change**: Use 12 tokens for first chunk instead of 25, then 25 for subsequent chunks.
+
+**Rationale**: Faster TTFB by processing fewer tokens initially.
+
+```
+Server Metrics:
+  First chunk: 723-881ms  (down from 1256ms!)
+  Total time: 3519-6129ms
+  Audio duration: 3080-4720ms
+  Realtime factor: 1.14-1.30x
+  Tokens: 78-119
+  Chunks: 4-6
+
+Client Metrics:
+  Time to first audio: 1565-1836ms (down from 2114ms)
+```
+
+**Results**:
+- Server TTFB improved by ~500ms ✅
+- Client TTFB improved by ~500ms ✅
+- RTF slightly improved ✅
+
+**Remaining Issue**: ~900ms gap between server send and client receive
+- Server says first chunk at 881ms
+- Client says first audio at 1836ms
+- Gap: ~955ms (consistent across tests)
+
+**Observations**:
+1. First chunk plays smoothly
+2. **Hiccup between chunks** - if playback catches up to processing, there's a gap
+3. The problem is the sequential nature: T3 → CFM → HiFiGAN → Send → Play
+
+---
+
+## Open Questions for Deep Analysis
+
+### Question 1: Why is there a ~900ms client-side latency gap?
+
+Server sends first chunk at 881ms, client receives at 1836ms. Where does the extra 955ms go?
+
+Possible causes:
+- WebSocket serialization/deserialization overhead
+- asyncio event loop blocking during `asyncio.to_thread()`
+- Client-side buffering before `add_chunk()` is called
+- sounddevice/PortAudio initialization latency
+
+### Question 2: How to eliminate chunk hiccups?
+
+Current flow is BLOCKING:
+```
+T3: [gen 12 tok]────────[gen 25 tok]────────[gen 25 tok]
+CFM:            [proc]              [proc]              [proc]
+Play:                [play]              [play]
+                      ^                   ^
+                   hiccup if          hiccup if
+                   play > proc        play > proc
+```
+
+The hiccup happens when:
+- Chunk N finishes playing
+- Chunk N+1 is still being processed by CFM
+- Result: silence gap
+
+### Question 3: Would pipeline parallelism fix this?
+
+Proposed parallel flow:
+```
+T3:   [gen 12][gen 25][gen 25][gen 25]
+CFM:       [proc 1][proc 2][proc 3]
+Send:           [1][2][3][4]
+Play:              [1][2][3][4]
+```
+
+Benefits:
+- T3 keeps generating while CFM processes
+- Audio buffer stays full
+- No hiccups
+
+Challenges:
+- Thread synchronization
+- z_cache needs to be updated atomically
+- Memory management for queued tokens
+
+---
+
 ## Remaining Paths for Improvement
 
 ### Path A: Reduce TTFB Further
