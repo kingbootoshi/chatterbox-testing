@@ -265,6 +265,54 @@ Challenges:
 
 ---
 
+## SOLUTION: Jitter Buffer (2025-12-16)
+
+### The Fix That Worked
+
+**Jitter buffer** - buffer audio before starting playback to handle variable chunk timing.
+
+```bash
+# Usage
+python client.py --flow --jitter 800 "Hello world"
+```
+
+### How It Works
+
+```
+Without jitter buffer:
+  Chunk 1 arrives → Play immediately → Chunk 1 ends → Wait for Chunk 2 → SILENCE
+
+With jitter buffer (800ms):
+  Chunk 1 arrives → Buffer
+  Chunk 2 arrives → Buffer now has 800ms+ → Start playing
+  While playing Chunk 1, Chunk 3 arrives → No gaps!
+```
+
+### Results
+
+**PERFECTLY SMOOTH PLAYBACK!**
+
+- No hiccups between chunks
+- Continuous audio stream
+- Slight delay before playback starts (the buffer time)
+- But once it starts, it's seamless
+
+### Implementation
+
+Added to `StreamingAudioPlayer`:
+- `jitter_buffer_ms` parameter
+- Accumulates chunks until buffer threshold reached
+- Then flushes to playback queue and continues normally
+- Uses `threading.Event` for synchronization
+
+### Additional Optimization: CFM Steps
+
+Also added `--cfm-steps` flag to control ODE solver steps:
+- `--cfm-steps 2` (default) - standard quality
+- `--cfm-steps 1` - faster inference, may improve RTF
+
+---
+
 ## Remaining Paths for Improvement
 
 ### Path A: Reduce TTFB Further
