@@ -87,11 +87,13 @@ class S3GenStreamer:
         self,
         tts_model: ChatterboxTurboTTS,
         tokens_per_chunk: int = 25,
+        n_cfm_timesteps: int = 2,
     ):
         self.model = tts_model
         self.s3gen = tts_model.s3gen
         self.ref_dict = tts_model.conds.gen
         self.tokens_per_chunk = tokens_per_chunk
+        self.n_cfm_timesteps = n_cfm_timesteps
         # NOTE: lookahead is handled internally by inference_streaming (3 tokens = 6 mel frames)
         self.reset()
 
@@ -120,7 +122,7 @@ class S3GenStreamer:
             speech_tokens=speech_tokens,
             ref_dict=self.ref_dict,
             z_cache=self.z_cache,
-            n_cfm_timesteps=2,
+            n_cfm_timesteps=self.n_cfm_timesteps,
             finalize=finalize,
         )
         return mels
@@ -1072,13 +1074,14 @@ async def tts_flow_websocket(websocket: WebSocket):
                 continue
 
             first_chunk_tokens = request.get("first_chunk_tokens", FIRST_CHUNK_TOKENS)
-            logger.info(f"Client {client_id} (flow): '{text[:50]}...' (first={first_chunk_tokens}, chunk={tokens_per_chunk})")
+            n_cfm_timesteps = request.get("n_cfm_timesteps", 2)
+            logger.info(f"Client {client_id} (flow): '{text[:50]}...' (first={first_chunk_tokens}, chunk={tokens_per_chunk}, cfm={n_cfm_timesteps})")
 
             async with generation_lock:
                 t_start = time.perf_counter()
 
                 # Create streamer with z_cache support for noise continuity
-                streamer = S3GenStreamer(model, tokens_per_chunk=tokens_per_chunk)
+                streamer = S3GenStreamer(model, tokens_per_chunk=tokens_per_chunk, n_cfm_timesteps=n_cfm_timesteps)
 
                 # Prepare T3 generation
                 text_normalized = punc_norm(text)
@@ -1191,6 +1194,7 @@ async def tts_flow_websocket(websocket: WebSocket):
                             "chunks_sent": chunk_count,
                             "first_chunk_tokens": first_chunk_tokens,
                             "tokens_per_chunk": tokens_per_chunk,
+                            "n_cfm_timesteps": n_cfm_timesteps,
                             "mode": "flow_streaming",
                         }
                     }

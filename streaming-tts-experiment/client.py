@@ -32,25 +32,44 @@ DEFAULT_SERVER_URL = "ws://localhost:8765/ws/tts"
 
 class StreamingAudioPlayer:
     """
-    Real-time audio player that plays chunks as they arrive.
+    Real-time audio player with optional jitter buffer.
 
     Uses sentinel-only termination to ensure all buffered audio is played
     before stopping. Call stop() to signal end and wait for playback to finish.
+
+    Jitter buffer mode:
+    - Buffers audio until jitter_buffer_ms worth of audio is accumulated
+    - Then starts playback, ensuring smooth continuous audio even if
+      chunks arrive with variable timing
     """
 
-    def __init__(self, sample_rate: int = SAMPLE_RATE):
+    def __init__(self, sample_rate: int = SAMPLE_RATE, jitter_buffer_ms: int = 0):
         self.sample_rate = sample_rate
+        self.jitter_buffer_ms = jitter_buffer_ms
+        self.bytes_per_second = sample_rate * 2  # int16 = 2 bytes per sample
+        self.jitter_buffer_bytes = int((jitter_buffer_ms / 1000) * self.bytes_per_second)
+
         self.audio_queue = queue.Queue()
         self.playback_thread = None
         self.first_chunk_time = None
         self.playback_started_time = None
         self.total_samples_played = 0
 
+        # Jitter buffer state
+        self.jitter_buffer = []
+        self.jitter_buffer_size = 0
+        self.jitter_buffer_ready = threading.Event()
+        self.stream_ended = False
+
     def start(self):
         """Start the audio playback thread."""
         self.first_chunk_time = None
         self.playback_started_time = None
         self.total_samples_played = 0
+        self.jitter_buffer = []
+        self.jitter_buffer_size = 0
+        self.jitter_buffer_ready.clear()
+        self.stream_ended = False
         self.playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
         self.playback_thread.start()
 
@@ -62,6 +81,9 @@ class StreamingAudioPlayer:
         to consume all remaining audio before returning. This ensures
         no audio is lost at the end.
         """
+        self.stream_ended = True
+        # If jitter buffer hasn't been flushed yet, signal it's ready (stream ended)
+        self.jitter_buffer_ready.set()
         # Push sentinel to tell the playback loop to exit when done
         self.audio_queue.put(None)
         # Wait for playback to finish (all audio consumed)
@@ -69,10 +91,26 @@ class StreamingAudioPlayer:
             self.playback_thread.join(timeout=10.0)
 
     def add_chunk(self, audio_bytes: bytes):
-        """Add an audio chunk to the playback queue."""
+        """Add an audio chunk to the playback queue (or jitter buffer)."""
         if self.first_chunk_time is None:
             self.first_chunk_time = time.perf_counter()
-        self.audio_queue.put(audio_bytes)
+
+        if self.jitter_buffer_ms > 0 and not self.jitter_buffer_ready.is_set():
+            # Accumulate in jitter buffer until threshold reached
+            self.jitter_buffer.append(audio_bytes)
+            self.jitter_buffer_size += len(audio_bytes)
+
+            buffered_ms = (self.jitter_buffer_size / self.bytes_per_second) * 1000
+            if self.jitter_buffer_size >= self.jitter_buffer_bytes:
+                logger.debug(f"Jitter buffer full ({buffered_ms:.0f}ms), starting playback")
+                # Flush buffer to queue
+                for chunk in self.jitter_buffer:
+                    self.audio_queue.put(chunk)
+                self.jitter_buffer = []
+                self.jitter_buffer_ready.set()
+        else:
+            # Normal mode or jitter buffer already flushed
+            self.audio_queue.put(audio_bytes)
 
     def _playback_loop(self):
         """
@@ -82,6 +120,14 @@ class StreamingAudioPlayer:
         audio is played before exiting.
         """
         try:
+            # Wait for jitter buffer if enabled
+            if self.jitter_buffer_ms > 0:
+                self.jitter_buffer_ready.wait()
+                # Flush any remaining buffer (in case stream ended early)
+                for chunk in self.jitter_buffer:
+                    self.audio_queue.put(chunk)
+                self.jitter_buffer = []
+
             with sd.OutputStream(
                 samplerate=self.sample_rate,
                 channels=1,
@@ -353,18 +399,34 @@ async def run_stateful_client(text: str, server_url: str, tokens_per_chunk: int)
         player.stop()
 
 
-async def run_flow_client(text: str, server_url: str, tokens_per_chunk: int):
+async def run_flow_client(
+    text: str,
+    server_url: str,
+    tokens_per_chunk: int,
+    jitter_buffer_ms: int = 0,
+    cfm_steps: int = 2,
+):
     """
     Connect to flow endpoint - TRUE streaming with flow_cache continuity.
 
     This is the RECOMMENDED mode for streaming TTS. It maintains flow-level
     state between chunks, ensuring all chunks share the same latent trajectory
     without boundary artifacts.
+
+    Args:
+        text: Text to synthesize
+        server_url: WebSocket server URL
+        tokens_per_chunk: Tokens per audio chunk
+        jitter_buffer_ms: Buffer this much audio before starting playback (0=disabled)
+        cfm_steps: Number of CFM ODE solver steps (1=fastest, 2=default)
     """
     url = server_url.replace("/ws/tts", "/ws/tts/flow")
-    logger.info(f"Connecting to {url} (flow mode - true streaming)...")
 
-    player = StreamingAudioPlayer()
+    jitter_info = f", jitter={jitter_buffer_ms}ms" if jitter_buffer_ms > 0 else ""
+    cfm_info = f", cfm_steps={cfm_steps}" if cfm_steps != 2 else ""
+    logger.info(f"Connecting to {url} (flow mode{jitter_info}{cfm_info})...")
+
+    player = StreamingAudioPlayer(jitter_buffer_ms=jitter_buffer_ms)
     t_request_start = time.perf_counter()
 
     try:
@@ -374,15 +436,17 @@ async def run_flow_client(text: str, server_url: str, tokens_per_chunk: int):
             request = {
                 "text": text,
                 "tokens_per_chunk": tokens_per_chunk,
+                "n_cfm_timesteps": cfm_steps,
             }
             await ws.send(json.dumps(request))
-            logger.info(f"Sent: '{text[:60]}...' (tokens={tokens_per_chunk}, flow mode)")
+            logger.info(f"Sent: '{text[:60]}...' (tokens={tokens_per_chunk}, cfm={cfm_steps})")
 
             player.start()
 
             chunks_received = 0
             total_bytes = 0
             t_first_audio = None
+            t_playback_start = None
 
             async for message in ws:
                 if isinstance(message, bytes):
@@ -394,6 +458,10 @@ async def run_flow_client(text: str, server_url: str, tokens_per_chunk: int):
                         t_first_audio = time.perf_counter()
                         latency = (t_first_audio - t_request_start) * 1000
                         logger.success(f"First audio chunk in {latency:.0f}ms!")
+
+                    # Track when playback actually starts (jitter buffer may delay it)
+                    if t_playback_start is None and player.playback_started_time is not None:
+                        t_playback_start = player.playback_started_time
 
                 else:
                     data = json.loads(message)
@@ -412,6 +480,8 @@ async def run_flow_client(text: str, server_url: str, tokens_per_chunk: int):
                         logger.info(f"  Text: '{text[:45]}...'")
                         logger.info(f"  Chunks received: {chunks_received}")
                         logger.info(f"  Total audio: {total_bytes / 1000:.1f} KB")
+                        if jitter_buffer_ms > 0:
+                            logger.info(f"  Jitter buffer: {jitter_buffer_ms}ms")
                         logger.info("")
                         logger.info("Server Metrics:")
                         logger.info(f"  First chunk: {stats.get('t_first_chunk_ms', 0):.0f}ms")
@@ -419,10 +489,14 @@ async def run_flow_client(text: str, server_url: str, tokens_per_chunk: int):
                         logger.info(f"  Audio duration: {stats.get('audio_duration_ms', 0):.0f}ms")
                         logger.info(f"  Realtime factor: {stats.get('realtime_factor', 0):.2f}x")
                         logger.info(f"  Tokens: {stats.get('total_tokens', 0)}")
+                        logger.info(f"  CFM steps: {stats.get('n_cfm_timesteps', cfm_steps)}")
                         logger.info("")
                         logger.info("Client Metrics:")
                         if t_first_audio:
                             logger.info(f"  Time to first audio: {(t_first_audio - t_request_start)*1000:.0f}ms")
+                        if jitter_buffer_ms > 0 and player.playback_started_time:
+                            playback_delay = (player.playback_started_time - t_request_start) * 1000
+                            logger.info(f"  Time to playback start: {playback_delay:.0f}ms")
                         logger.info("=" * 55)
                         break
 
@@ -573,6 +647,18 @@ Examples:
         default=200,
         help="Chunk duration in ms for simple mode (default: 200)",
     )
+    parser.add_argument(
+        "--jitter",
+        type=int,
+        default=0,
+        help="Jitter buffer in ms - buffer audio before playback to avoid hiccups (default: 0, try 800)",
+    )
+    parser.add_argument(
+        "--cfm-steps",
+        type=int,
+        default=2,
+        help="CFM ODE solver steps - 1=fastest, 2=default quality (default: 2)",
+    )
 
     args = parser.parse_args()
 
@@ -587,7 +673,13 @@ Examples:
     if args.simple:
         asyncio.run(run_simple_client(args.text, args.server, args.chunk))
     elif args.flow:
-        asyncio.run(run_flow_client(args.text, args.server, args.tokens))
+        asyncio.run(run_flow_client(
+            args.text,
+            args.server,
+            args.tokens,
+            jitter_buffer_ms=args.jitter,
+            cfm_steps=args.cfm_steps,
+        ))
     elif args.stateful:
         asyncio.run(run_stateful_client(args.text, args.server, args.tokens))
     elif args.crossfade:
