@@ -353,3 +353,55 @@ CFM forward pass with z_cache restore/save.
 
 ### inference_streaming (flow.py:200-295)
 Flow inference wrapper passing z_cache through encoder/decoder.
+
+---
+
+## LLM Stream → TTS Pipeline (2025-12-16)
+
+### What Was Built
+
+New endpoint `/ws/tts/llm-stream` that accepts LLM text chunks and outputs audio:
+
+```
+LLM tokens → SentenceAggregator → T3 → S3Gen → Audio chunks
+```
+
+### Files Created
+
+| File | Purpose |
+|------|---------|
+| `sentence_aggregator.py` | Buffers text, yields complete sentences |
+| `llm_client.py` | Simulated LLM + test client |
+| `server.py` (modified) | Added `/ws/tts/llm-stream` endpoint |
+
+### Sentence Aggregator
+
+Handles edge cases:
+- Punctuation (.!?) → sentence boundary
+- Newlines → paragraph/line breaks
+- No punctuation → max_chars fallback (200 chars)
+- Short text → buffer until enough
+
+### Usage
+
+```bash
+# Start server
+uv run python server.py
+
+# Run simulated LLM → TTS
+python llm_client.py --simulate --jitter 800 "Hello, this is a test."
+```
+
+### Research Sources
+
+- **Pipecat** (pipecat.ai) - Frame-based pipeline architecture
+- **RealtimeTTS** (GitHub) - LLM stream → TTS integration
+- **OpenAI Streaming** - `finish_reason: "stop"` for end detection
+- **Picovoice** - Dual-streaming TTS concept
+
+### Next Steps
+
+1. **Test the pipeline** - Run server + llm_client.py
+2. **Tune sentence chunking** - Adjust min/max chars
+3. **Real LLM integration** - OpenAI/Anthropic streaming API
+4. **STT input** - Complete voice-to-voice loop

@@ -1215,6 +1215,261 @@ async def tts_flow_websocket(websocket: WebSocket):
         traceback.print_exc()
 
 
+@app.websocket("/ws/tts/llm-stream")
+async def tts_llm_stream_websocket(websocket: WebSocket):
+    """
+    WebSocket endpoint for LLM streaming → TTS pipeline.
+
+    Accepts text chunks from an LLM stream, aggregates into sentences,
+    and streams audio back in real-time.
+
+    Input messages:
+    - {"type": "text", "content": "chunk of text"}
+    - {"type": "end"}  # Signal end of LLM stream
+
+    Output:
+    - Binary audio chunks (PCM int16, 24kHz, mono)
+    - {"type": "complete", "stats": {...}}
+    """
+    from sentence_aggregator import SentenceAggregator
+
+    await websocket.accept()
+    client_id = id(websocket)
+    logger.info(f"Client {client_id} connected (LLM stream mode)")
+
+    try:
+        while True:
+            # Wait for initial config or first text chunk
+            init_data = await websocket.receive_text()
+            init_request = json.loads(init_data)
+
+            # Optional config in first message
+            tokens_per_chunk = init_request.get("tokens_per_chunk", TOKENS_PER_CHUNK)
+            n_cfm_timesteps = init_request.get("n_cfm_timesteps", 2)
+            min_sentence_chars = init_request.get("min_sentence_chars", 20)
+            max_sentence_chars = init_request.get("max_sentence_chars", 200)
+
+            logger.info(f"Client {client_id} (llm-stream): config received")
+
+            async with generation_lock:
+                t_start = time.perf_counter()
+
+                # Initialize components
+                aggregator = SentenceAggregator(
+                    min_chars=min_sentence_chars,
+                    max_chars=max_sentence_chars,
+                )
+                streamer = S3GenStreamer(
+                    model,
+                    tokens_per_chunk=tokens_per_chunk,
+                    n_cfm_timesteps=n_cfm_timesteps,
+                )
+
+                # Setup T3 generation components
+                logits_processors = LogitsProcessorList([
+                    TemperatureLogitsWarper(0.8),
+                    TopKLogitsWarper(1000),
+                    TopPLogitsWarper(0.95),
+                    RepetitionPenaltyLogitsProcessor(1.2),
+                ])
+
+                t3 = model.t3
+                t3_cond = model.conds.t3
+
+                chunk_count = 0
+                sentence_count = 0
+                total_chars = 0
+                t_first_audio = None
+
+                try:
+                    # Process if first message had text content
+                    if init_request.get("type") == "text" and init_request.get("content"):
+                        sentences = aggregator.add_chunk(init_request["content"])
+                        total_chars += len(init_request.get("content", ""))
+
+                        for sentence in sentences:
+                            sentence_count += 1
+                            audio = await _generate_sentence_audio(
+                                sentence, t3, t3_cond, logits_processors, streamer
+                            )
+                            if len(audio) > 0:
+                                chunk_count += 1
+                                if t_first_audio is None:
+                                    t_first_audio = time.perf_counter()
+                                    logger.success(f"First audio in {(t_first_audio - t_start)*1000:.0f}ms")
+                                await websocket.send_bytes(audio.tobytes())
+
+                    # Process stream
+                    stream_done = False
+                    while not stream_done:
+                        try:
+                            message = await asyncio.wait_for(
+                                websocket.receive_text(),
+                                timeout=30.0  # 30s timeout for next chunk
+                            )
+                            data = json.loads(message)
+
+                            if data.get("type") == "text":
+                                content = data.get("content", "")
+                                total_chars += len(content)
+                                sentences = aggregator.add_chunk(content)
+
+                                for sentence in sentences:
+                                    sentence_count += 1
+                                    logger.debug(f"Processing sentence {sentence_count}: '{sentence[:40]}...'")
+
+                                    audio = await _generate_sentence_audio(
+                                        sentence, t3, t3_cond, logits_processors, streamer
+                                    )
+                                    if len(audio) > 0:
+                                        chunk_count += 1
+                                        if t_first_audio is None:
+                                            t_first_audio = time.perf_counter()
+                                            logger.success(f"First audio in {(t_first_audio - t_start)*1000:.0f}ms")
+                                        await websocket.send_bytes(audio.tobytes())
+
+                            elif data.get("type") == "end":
+                                stream_done = True
+
+                        except asyncio.TimeoutError:
+                            logger.warning(f"Client {client_id}: timeout waiting for next chunk")
+                            stream_done = True
+
+                    # Flush remaining text
+                    remaining = aggregator.flush()
+                    if remaining:
+                        sentence_count += 1
+                        logger.debug(f"Flushing final sentence: '{remaining[:40]}...'")
+
+                        audio = await _generate_sentence_audio(
+                            remaining, t3, t3_cond, logits_processors, streamer, finalize=True
+                        )
+                        if len(audio) > 0:
+                            chunk_count += 1
+                            await websocket.send_bytes(audio.tobytes())
+
+                    # Stats
+                    t_total = time.perf_counter() - t_start
+                    total_samples = streamer.total_mels_emitted * 480
+                    audio_duration = total_samples / SAMPLE_RATE
+
+                    final_stats = {
+                        "type": "complete",
+                        "stats": {
+                            "t_total_ms": round(t_total * 1000, 2),
+                            "t_first_audio_ms": round((t_first_audio - t_start) * 1000, 2) if t_first_audio else 0,
+                            "audio_duration_ms": round(audio_duration * 1000, 2),
+                            "realtime_factor": round(t_total / audio_duration, 3) if audio_duration > 0 else 0,
+                            "total_chars": total_chars,
+                            "sentences_processed": sentence_count,
+                            "chunks_sent": chunk_count,
+                            "mode": "llm_stream",
+                        }
+                    }
+                    await websocket.send_json(final_stats)
+                    logger.info(
+                        f"Client {client_id} complete (llm-stream): "
+                        f"sentences={sentence_count}, chunks={chunk_count}, "
+                        f"rtf={final_stats['stats']['realtime_factor']:.2f}x"
+                    )
+
+                except Exception as e:
+                    logger.error(f"Generation error: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    await websocket.send_json({"type": "error", "message": str(e)})
+
+    except WebSocketDisconnect:
+        logger.info(f"Client {client_id} disconnected")
+    except Exception as e:
+        logger.error(f"Client {client_id} error: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+async def _generate_sentence_audio(
+    sentence: str,
+    t3,
+    t3_cond,
+    logits_processors,
+    streamer: S3GenStreamer,
+    finalize: bool = False,
+) -> np.ndarray:
+    """
+    Generate audio for a single sentence using T3 + S3Gen streaming.
+
+    Args:
+        sentence: Text to synthesize
+        t3: T3 model
+        t3_cond: T3 conditioning
+        logits_processors: Logits processors for sampling
+        streamer: S3GenStreamer instance
+        finalize: Whether this is the final sentence
+
+    Returns:
+        Audio samples as np.int16 array
+    """
+    # Tokenize
+    text_normalized = punc_norm(sentence)
+    text_tokens = model.tokenizer(text_normalized, return_tensors="pt", padding=True, truncation=True)
+    text_tokens = text_tokens.input_ids.to(model.device)
+
+    # Initialize T3
+    speech_start_token = t3.hp.start_speech_token * torch.ones_like(text_tokens[:, :1])
+    embeds, _ = t3.prepare_input_embeds(
+        t3_cond=t3_cond,
+        text_tokens=text_tokens,
+        speech_tokens=speech_start_token,
+        cfg_weight=0.0,
+    )
+
+    llm_outputs = t3.tfmr(inputs_embeds=embeds, use_cache=True)
+    hidden_states = llm_outputs[0]
+    past_key_values = llm_outputs.past_key_values
+
+    speech_logits = t3.speech_head(hidden_states[:, -1:])
+    processed_logits = logits_processors(speech_start_token, speech_logits[:, -1, :])
+    probs = F.softmax(processed_logits, dim=-1)
+    current_token = torch.multinomial(probs, num_samples=1)
+
+    streamer.append_token(current_token)
+
+    # Generate all tokens for this sentence
+    for _ in range(500):  # max tokens per sentence
+        current_embed = t3.speech_emb(current_token)
+        llm_outputs = t3.tfmr(
+            inputs_embeds=current_embed,
+            past_key_values=past_key_values,
+            use_cache=True
+        )
+        hidden_states = llm_outputs[0]
+        past_key_values = llm_outputs.past_key_values
+        speech_logits = t3.speech_head(hidden_states)
+
+        # Get all tokens so far for this sentence
+        all_tokens = torch.cat([t for t in streamer.speech_tokens], dim=1)
+        processed_logits = logits_processors(all_tokens, speech_logits[:, -1, :])
+
+        if torch.all(processed_logits == -float("inf")):
+            break
+
+        probs = F.softmax(processed_logits, dim=-1)
+        current_token = torch.multinomial(probs, num_samples=1)
+
+        # Check for EOS
+        if torch.all(current_token == t3.hp.stop_speech_token):
+            break
+
+        streamer.append_token(current_token)
+
+    # Run TTS
+    def _run_tts():
+        return streamer.step(finalize=finalize)
+
+    audio = await asyncio.to_thread(_run_tts)
+    return audio
+
+
 @app.websocket("/ws/tts/simple")
 async def tts_simple_websocket(websocket: WebSocket):
     """
